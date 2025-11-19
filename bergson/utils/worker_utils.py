@@ -81,6 +81,7 @@ def setup_model_and_peft(
     try:
         peft_config = PeftConfig.from_pretrained(cfg.model)
     except ValueError:
+        print(f"PEFT config not found for model {cfg.model}")
         peft_config = None
 
     if peft_config is None:
