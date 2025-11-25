@@ -188,3 +188,4 @@ influence_results/
 tmp/
 .idea/
 uv.lock
+data/*.hf
