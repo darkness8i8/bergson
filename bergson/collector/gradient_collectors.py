@@ -126,7 +126,7 @@ class GradientCollector(HookCollectorBase):
 
         if p is not None and (normalizer is None or not module._has_bias):
             a_projection = self.projection(name, p, i, "right", a.device, a.dtype).T
-            a = a @ a_projection  # type: ignore
+            a = a @ a_projection  # [N, S, I(+1)] @ [I(+1), p] → [N, S, p]
 
         module._inputs = a
 
@@ -248,7 +248,7 @@ class GradientCollector(HookCollectorBase):
                     P = P.flatten(2)  # [N, S, grad_dim]
                     P = P[self._current_valid_mask]  # [total_valid, grad_dim]
                 else:
-                    P = g.mT @ a  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
+                    P = g.mT @ a  # [N, O/p, I(+1)/p]
 
         P = P.flatten(1).clamp_(self.lo, self.hi)
 
