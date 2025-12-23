@@ -174,7 +174,7 @@ def finetune(dataset_path, analysis_model_name, finetuned_model_path):
 
 
 def main():
-    # create_data()
+    create_data()
     dataset_paths = [
         "data/facts_dataset_shakespeare-Qwen3-8B-Base.hf",
         "data/facts_dataset_pirate-Qwen3-8B-Base.hf",

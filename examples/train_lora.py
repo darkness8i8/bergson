@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 
 from bergson.config import DataConfig, IndexConfig
-from bergson.worker_utils import setup_data_pipeline
+from bergson.utils.worker_utils import setup_data_pipeline
 
 
 class TrainingConfig(BaseModel):
@@ -274,8 +274,11 @@ def main():
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--prompt_column", type=str, default="prompt")
     parser.add_argument("--completion_column", type=str, default="completion")
-
+    parser.add_argument("--no_push_to_private", action="store_false", dest="push_to_private")
+    
     args = parser.parse_args()
+
+    print(f"push_to_private: {args.push_to_private}")
 
     training_config = TrainingConfig(  # type: ignore
         finetuned_model_id=args.finetuned_model_path,  # type: ignore
@@ -286,6 +289,7 @@ def main():
         prompt_column=args.prompt_column,  # type: ignore
         completion_column=args.completion_column,  # type: ignore
         merge_before_push=False,
+        push_to_private=args.push_to_private,
     )  # type: ignore
 
     dataset = setup_data_pipeline(

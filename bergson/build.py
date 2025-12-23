@@ -51,7 +51,7 @@ def build_worker(
             init_method=f"tcp://{addr}:{port}",
             device_id=torch.device(f"cuda:{rank}"),
             rank=rank,
-            timeout=timedelta(hours=1),
+            timeout=timedelta(minutes=2),
             world_size=world_size,
         )
 

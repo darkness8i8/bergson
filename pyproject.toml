@@ -35,6 +35,9 @@ dev = [
     "nbsphinx",
 ]
 example = [
+    "backoff>=2.2.1",
+    "bitsandbytes>=0.49.0",
+    "pydantic>=2.12.5",
     "trl",
 ]
 faiss = [
