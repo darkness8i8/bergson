@@ -278,8 +278,6 @@ def main():
     
     args = parser.parse_args()
 
-    print(f"push_to_private: {args.push_to_private}")
-
     training_config = TrainingConfig(  # type: ignore
         finetuned_model_id=args.finetuned_model_path,  # type: ignore
         model=args.model_name,  # type: ignore
