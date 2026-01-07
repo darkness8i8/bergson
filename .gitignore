@@ -189,3 +189,7 @@ tmp/
 .idea/
 uv.lock
 data/*.hf
+zeki_requirements.txt
+.python-version
+*package-lock.json
+*package.json
