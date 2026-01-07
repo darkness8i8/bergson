@@ -14,6 +14,11 @@ from bergson.data import load_gradients
 
 
 def run_bergson_build(index_path: str, dataset_path: str):
+    # Skip if index already exists
+    if Path(index_path).exists() and (Path(index_path) / "info.json").exists():
+        print(f"Index {index_path} already exists, skipping...")
+        return
+
     cmd = [
         "bergson", "build", index_path,
         "--model", "Qwen/Qwen3-4B",
@@ -22,7 +27,6 @@ def run_bergson_build(index_path: str, dataset_path: str):
         "--fsdp",
         "--projection_dim", "16",
         "--token_batch_size", "4000",
-        "--overwrite",
     ]
     print(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
@@ -89,6 +93,47 @@ def main():
     cosines = (a_norm * a_comb_norm).sum(dim=1)
     print()
     print(f"Cosine similarity (A separate vs A in combined): mean={cosines.mean():.4f}")
+
+    # Check if driven by outliers
+    print()
+    print("=" * 70)
+    print("ROOT CAUSE: OUTLIERS")
+    print("=" * 70)
+
+    norms_a = grads_a.norm(dim=1)
+    norms_a_comb = grads_a_in_combined.norm(dim=1)
+    norms_b = grads_b.norm(dim=1)
+    norms_b_comb = grads_b_in_combined.norm(dim=1)
+
+    # Find the worst outliers
+    ratio_a = norms_a / norms_a_comb
+    ratio_b = norms_b / norms_b_comb
+    worst_a_idx = ratio_a.argmax().item()
+    worst_b_idx = ratio_b.argmin().item()  # B outlier has ratio < 1
+
+    print(f"A outlier: sample {worst_a_idx}")
+    print(f"  separate norm: {norms_a[worst_a_idx]:.2e}")
+    print(f"  combined norm: {norms_a_comb[worst_a_idx]:.2e}")
+    print(f"  ratio: {ratio_a[worst_a_idx]:.0f}x")
+    print()
+    print(f"B outlier: sample {worst_b_idx}")
+    print(f"  separate norm: {norms_b[worst_b_idx]:.2e}")
+    print(f"  combined norm: {norms_b_comb[worst_b_idx]:.2e}")
+    print(f"  ratio: {ratio_b[worst_b_idx]:.4f}x (combined {1/ratio_b[worst_b_idx]:.0f}x larger)")
+
+    # Filter outliers and recompute
+    print()
+    print("=" * 70)
+    print("AFTER REMOVING OUTLIERS (norm > 10x median in EITHER index)")
+    print("=" * 70)
+    mask_a = (norms_a < 10 * norms_a.median()) & (norms_a_comb < 10 * norms_a_comb.median())
+    mask_b = (norms_b < 10 * norms_b.median()) & (norms_b_comb < 10 * norms_b_comb.median())
+
+    print(f"A: removed {(~mask_a).sum().item()} outliers")
+    print(f"  std ratio: {grads_a[mask_a].std() / grads_a_in_combined[mask_a].std():.2f}x")
+    print()
+    print(f"B: removed {(~mask_b).sum().item()} outliers")
+    print(f"  std ratio: {grads_b[mask_b].std() / grads_b_in_combined[mask_b].std():.2f}x")
 
 
 if __name__ == "__main__":
