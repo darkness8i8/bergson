@@ -17,7 +17,7 @@ All three commands run the same underlying gradient collection pipeline:
 The difference between them is **what they do with the collected gradients**:
 
 - ``build`` writes a **per-example gradient** to an on-disk index.
-- ``reduce`` **aggregates** all gradients from a dataset into a single vector.
+- ``reduce`` **aggregates** all gradients from a dataset into a single vector and writes it to an on-disk file.
 - ``score`` **computes similarity scores** by comparing gradients from one dataset against a pre-built query.
 
 .. _build-command:
