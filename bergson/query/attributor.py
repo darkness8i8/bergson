@@ -158,7 +158,7 @@ class Attributor:
         else:
             modules = set(self.ordered_modules)
 
-        k = min(k or self.N, self.N)
+        k = self.N if k is None else min(k, self.N)
 
         scores = torch.stack(
             [q[name] @ self.grads[name].mT for name in modules], dim=-1
