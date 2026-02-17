@@ -194,7 +194,7 @@ The decision tree below covers the most common scenarios:
 
    Do you want to search a gradient index interactively (e.g. per-prompt)?
    ├── Yes → use build + query
-   └── No  → Do you want to rank a dataset by influence against a fixed query?
+   └── No  → Do you want to use full gradients without random projection or preconditioning?
              ├── Yes, and the query is a single dataset → use reduce (for query) + score
              └── Yes, and you may reuse the same index for many queries → use build + score
 
@@ -256,5 +256,5 @@ following the style of `LESS <https://arxiv.org/pdf/2402.04333>`_.
        --unit_normalize \
        --projection_dim 0
 
-The resulting ``runs/scores/scores.npy`` contains one score per training example.
+The resulting ``runs/scores/scores.bin`` contains one score per training example.
 Higher scores indicate stronger positive influence on the eval set.
