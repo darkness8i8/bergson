@@ -1,3 +1,4 @@
+import shutil
 import warnings
 from pathlib import Path
 from typing import cast
@@ -24,6 +25,23 @@ from bergson.data import allocate_batches, load_data_string, tokenize
 from bergson.gradients import GradientProcessor, Normalizer
 from bergson.normalizer.fit_normalizers import fit_normalizers
 from bergson.utils.utils import assert_type, get_layer_list
+
+
+def validate_run_path(index_cfg: IndexConfig):
+    """Validate the run path."""
+    if index_cfg.distributed.rank != 0:
+        return
+
+    for path in [Path(index_cfg.run_path), Path(index_cfg.partial_run_path)]:
+        if not path.exists():
+            continue
+
+        if index_cfg.overwrite:
+            shutil.rmtree(path)
+        else:
+            raise FileExistsError(
+                f"Run path {path} already exists. Use --overwrite to overwrite it."
+            )
 
 
 def create_normalizers(

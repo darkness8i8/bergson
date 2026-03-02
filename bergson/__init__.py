@@ -2,8 +2,6 @@ __version__ = "0.6.0"
 
 from .builders import (
     Builder,
-    InMemorySequenceBuilder,
-    InMemoryTokenBuilder,
     create_builder,
 )
 from .collection import collect_gradients
@@ -40,8 +38,6 @@ __all__ = [
     "load_token_gradients",
     "TokenGradients",
     "Builder",
-    "InMemorySequenceBuilder",
-    "InMemoryTokenBuilder",
     "create_builder",
     "fit_normalizers",
     "Attributor",
