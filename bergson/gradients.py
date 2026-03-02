@@ -18,7 +18,7 @@ class Normalizer(ABC):
     """
 
     bias_avg_sq: Tensor | None = None
-    """Optional second moments for bias parameters. Defined on subclasses."""
+    """Optional second moments for bias parameters. Set in subclasses."""
 
     def __init_subclass__(cls, **kwargs):
         """Automatically register subclasses in the NORMALIZER_TYPES dict."""
