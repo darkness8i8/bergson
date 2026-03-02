@@ -17,6 +17,9 @@ class Normalizer(ABC):
     Base class for normalizers that can be used to scale gradients.
     """
 
+    bias_avg_sq: Tensor | None = None
+    """Optional second moments for bias parameters. Defined on subclasses."""
+
     def __init_subclass__(cls, **kwargs):
         """Automatically register subclasses in the NORMALIZER_TYPES dict."""
         super().__init_subclass__(**kwargs)
