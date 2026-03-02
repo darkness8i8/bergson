@@ -58,11 +58,8 @@ class GradientCollector(HookCollectorBase):
 
         Sets up a Builder for gradient storage if not using a Scorer.
         """
-        model_device = (
-            getattr(self.model, "device", None) or next(self.model.parameters()).device
-        )
         assert isinstance(
-            model_device, torch.device
+            self.model.device, torch.device
         ), "Model device is not set correctly"
 
         if self.cfg.attribute_tokens:
@@ -76,7 +73,7 @@ class GradientCollector(HookCollectorBase):
 
         self.per_doc_losses = torch.full(
             (len(self.data),),
-            device=model_device,
+            device=self.model.device,
             dtype=torch.float32,
             fill_value=0.0,
         )

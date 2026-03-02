@@ -66,6 +66,10 @@ def simple_model_class(test_params):
                     self.fc2 = nn.Linear(O * 2, O, bias=include_bias)
                     self.layers = nn.Sequential(self.fc1, self.relu, self.fc2)
 
+            @property
+            def device(self):
+                return next(self.parameters()).device
+
             def forward(self, x):
                 return self.layers(x)
 
