@@ -36,8 +36,8 @@ class NormalizerCollector(HookCollectorBase):
     cfg: IndexConfig
     """Configuration for gradient index."""
 
-    normalizers: dict[str, Normalizer] = field(default_factory=dict)
-    _bias_accumulators: dict[str, torch.Tensor] = field(default_factory=dict)
+    weight_normalizers: dict[str, Normalizer] = field(default_factory=dict)
+    bias_accumulators: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def adafactor_update(self, name: str, g: torch.Tensor):
         # We follow the tensor2tensor implementation of Adafactor, which
@@ -48,9 +48,9 @@ class NormalizerCollector(HookCollectorBase):
         # col: mean over rows,    shape [I]
         col_acc = sq.mean(dim=0)
 
-        if (normalizer := self.normalizers.get(name)) is None:
+        if (normalizer := self.weight_normalizers.get(name)) is None:
             # initialize accumulators at zero
-            self.normalizers[name] = normalizer = AdafactorNormalizer(
+            self.weight_normalizers[name] = normalizer = AdafactorNormalizer(
                 torch.zeros_like(row_acc),
                 torch.zeros_like(col_acc),
             )
@@ -65,8 +65,10 @@ class NormalizerCollector(HookCollectorBase):
         sq = g.square_().float().sum(0)
 
         # initialize accumulators at zero
-        if (normalizer := self.normalizers.get(name)) is None:
-            self.normalizers[name] = normalizer = AdamNormalizer(torch.zeros_like(sq))
+        if (normalizer := self.weight_normalizers.get(name)) is None:
+            self.weight_normalizers[name] = normalizer = AdamNormalizer(
+                torch.zeros_like(sq)
+            )
         else:
             assert isinstance(normalizer, AdamNormalizer)
 
@@ -120,10 +122,10 @@ class NormalizerCollector(HookCollectorBase):
             # bias_grad = g.sum(dim=seq), shape [N, O]
             # bias_avg_sq = E[bias_grad^2], accumulated as sum then divided later
             bias_sq = g.sum(dim=1).float().square().sum(0)  # [O]
-            if name in self._bias_accumulators:
-                self._bias_accumulators[name].add_(bias_sq)
+            if name in self.bias_accumulators:
+                self.bias_accumulators[name].add_(bias_sq)
             else:
-                self._bias_accumulators[name] = bias_sq
+                self.bias_accumulators[name] = bias_sq
 
     def process_batch(self, indices: list[int], **kwargs):
         """Process collected gradients for a batch."""
@@ -131,7 +133,7 @@ class NormalizerCollector(HookCollectorBase):
     def teardown(self):
         """Finalize normalizer collection: average across samples and ranks."""
         # Divide by the number of documents processed and average across ranks
-        for normalizer in self.normalizers.values():
+        for normalizer in self.weight_normalizers.values():
             if isinstance(normalizer, AdamNormalizer):
                 normalizer.weight_avg_sq.div_(len(self.data))
                 if dist.is_initialized():
@@ -144,9 +146,9 @@ class NormalizerCollector(HookCollectorBase):
                     dist.all_reduce(normalizer.col, op=dist.ReduceOp.AVG)
 
         # Post-process bias accumulators
-        for name, normalizer in self.normalizers.items():
-            if name in self._bias_accumulators:
-                bias_sq = self._bias_accumulators[name]
+        for name, normalizer in self.weight_normalizers.items():
+            if name in self.bias_accumulators:
+                bias_sq = self.bias_accumulators[name]
                 bias_sq.div_(len(self.data))
                 if dist.is_initialized():
                     dist.all_reduce(bias_sq, op=dist.ReduceOp.AVG)
@@ -188,4 +190,4 @@ def fit_normalizers(
     )
     computer.run_with_collector_hooks(desc="Estimating normalizers")
 
-    return collector.normalizers
+    return collector.weight_normalizers
