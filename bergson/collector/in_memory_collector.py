@@ -13,16 +13,11 @@ from torch import Tensor, nn
 from bergson.collector.collector import HookCollectorBase
 from bergson.config import IndexConfig, ReduceConfig
 from bergson.data import Builder, create_builder
-from bergson.gradients import (
-    AdafactorNormalizer,
-    AdamNormalizer,
-    LayerAdapter,
-)
 from bergson.process_preconditioners import (
     process_preconditioners,
 )
 from bergson.score.scorer import Scorer
-from bergson.utils.utils import assert_type, get_gradient_dtype
+from bergson.utils.utils import get_gradient_dtype
 
 
 @dataclass(kw_only=True)
@@ -75,6 +70,7 @@ class InMemoryCollector(HookCollectorBase):
         assert isinstance(
             self.model.device, torch.device
         ), "Model device is not set correctly"
+        self.attribute_tokens = self.cfg.attribute_tokens
         if self.cfg.attribute_tokens:
             assert self.reduce_cfg is None, (
                 "attribute_tokens is incompatible" " with reduce mode."
@@ -142,130 +138,9 @@ class InMemoryCollector(HookCollectorBase):
         module: nn.Module,
         g: Float[Tensor, "N S O"],
     ) -> None:
-        """Compute per-sample gradient.
-
-        When ``self.cfg.attribute_tokens`` is True, computes
-        per-position gradients filtered to valid positions.
-        """
-        a = module._inputs  # [N, S, I/q]
-
-        assert isinstance(a, torch.Tensor), "Activation cache missing for module"
-        name = assert_type(str, module._name)
-        p = self.processor.projection_dim
-        i = getattr(module, LayerAdapter.in_attr(module))
-        o = getattr(module, LayerAdapter.out_attr(module))
-        normalizer = self.processor.normalizers.get(name)
-
-        bias_grad = None
-
-        if isinstance(normalizer, AdamNormalizer):
-            if self.cfg.attribute_tokens:
-                # Per-position outer product: [N,S,O,1]*[N,S,1,I] → [N,S,O,I]
-                P = g.unsqueeze(-1) * a.unsqueeze(-2)
-                P = normalizer.normalize_(P)  # broadcasts [O,I] over [N,S,O,I]
-                if module._has_bias and normalizer.bias_avg_sq is not None:
-                    # Per-token bias: [N, S, O] / [O] → [N, S, O]
-                    bias_col = g / normalizer.bias_avg_sq.sqrt().add(1e-8)
-                    P = torch.cat([P, bias_col.unsqueeze(-1)], dim=-1)
-                    i += 1
-                if p is not None:
-                    g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
-                    a_proj = self.projection(name, p, i, "right", g.device, g.dtype).T
-                    P = g_proj @ P @ a_proj  # [N, S, p, q]
-                P = P.flatten(2)  # [N, S, grad_dim]
-                P = P[self._current_valid_mask]  # [total_valid, grad_dim]
-            else:
-                full_gradient = g.mT @ a
-                P = normalizer.normalize_(full_gradient)
-                if module._has_bias and normalizer.bias_avg_sq is not None:
-                    bias_grad = g.sum(dim=1) / normalizer.bias_avg_sq.sqrt().add(1e-8)
-                    P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)
-                    i += 1
-                if p is not None:
-                    g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
-                    a_proj = self.projection(name, p, i, "right", g.device, g.dtype).T
-                    P = g_proj @ P @ a_proj
-        else:
-            if isinstance(normalizer, AdafactorNormalizer):
-                bias_per_token = None
-                if module._has_bias and normalizer.bias_avg_sq is not None:
-                    # Compute bias from RAW g (before row normalization)
-                    if self.cfg.attribute_tokens:
-                        bias_per_token = (
-                            g * normalizer.bias_avg_sq.add(1e-30).rsqrt()
-                        )  # [N, S, O]
-                    else:
-                        bias_grad = (
-                            g.sum(dim=1) * normalizer.bias_avg_sq.add(1e-30).rsqrt()
-                        )  # [N, O]
-
-                # Apply row normalization to g (for weights)
-                g_factor = normalizer.row.add(1e-30)
-                g_factor = g_factor.mean().sqrt() * g_factor.rsqrt()
-                g = g * g_factor.type_as(g)
-
-                if self.cfg.attribute_tokens:
-                    if bias_per_token is not None:
-                        # a was NOT projected in forward (bias needs combined proj)
-                        # [N, S, O, 1] * [N, S, 1, I] → [N, S, O, I]
-                        P = g.unsqueeze(-1) * a.unsqueeze(-2)
-                        P = torch.cat(
-                            [P, bias_per_token.unsqueeze(-1)], dim=-1
-                        )  # [N, S, O, I+1]
-                        i += 1
-                        if p is not None:
-                            g_proj = self.projection(
-                                name, p, o, "left", g.device, g.dtype
-                            )
-                            a_proj = self.projection(
-                                name, p, i, "right", a.device, a.dtype
-                            ).T
-                            P = g_proj @ P @ a_proj
-                    else:
-                        # a was already projected in forward; project g individually
-                        if p is not None:
-                            g_proj = self.projection(
-                                name, p, o, "left", g.device, g.dtype
-                            )
-                            g = g @ g_proj.T
-                        # [N, S, O/p, 1] * [N, S, 1, I/q] → [N, S, O/p, I/q]
-                        P = g.unsqueeze(-1) * a.unsqueeze(-2)
-                    P = P.flatten(2)  # [N, S, grad_dim]
-                    P = P[self._current_valid_mask]  # [total_valid, grad_dim]
-                elif bias_grad is not None:
-                    P = g.mT @ a
-                    P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)
-                    i += 1
-                    if p is not None:
-                        g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
-                        a_proj = self.projection(
-                            name, p, i, "right", a.device, a.dtype
-                        ).T
-                        P = g_proj @ P @ a_proj
-                else:
-                    if p is not None:
-                        g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
-                        g = g @ g_proj.T
-
-                    P = g.mT @ a
-            else:
-                # No normalizer
-                if p is not None:
-                    g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
-                    g = g @ g_proj.T
-
-                if self.cfg.attribute_tokens:
-                    # Per-position outer product
-                    # [N,S,O/p,1]*[N,S,1,I/q] -> [N,S,O/p,I/q]
-                    P = g.unsqueeze(-1) * a.unsqueeze(-2)
-                    P = P.flatten(2)
-
-                    # Filter to valid positions
-                    P = P[self._current_valid_mask]
-                else:
-                    P = g.mT @ a
-
-        P = P.flatten(1).clamp_(self.lo, self.hi)
+        """Compute per-sample gradient, accumulate preconditioner, and store."""
+        name: str = module._name  # type: ignore[assignment]
+        P = self._compute_gradient(module, g)
 
         if not self.cfg.skip_preconditioners:
             P = P.float()

@@ -11,14 +11,9 @@ from torch import Tensor
 from bergson.collector.collector import HookCollectorBase
 from bergson.config import IndexConfig, ReduceConfig
 from bergson.data import Builder, create_builder
-from bergson.gradients import (
-    AdafactorNormalizer,
-    AdamNormalizer,
-    LayerAdapter,
-)
 from bergson.process_preconditioners import process_preconditioners
 from bergson.score.scorer import Scorer
-from bergson.utils.utils import assert_type, get_gradient_dtype
+from bergson.utils.utils import get_gradient_dtype
 
 
 @dataclass(kw_only=True)
@@ -63,6 +58,7 @@ class GradientCollectorWithDistributedPreconditioners(HookCollectorBase):
         assert isinstance(
             self.model.device, torch.device
         ), "Model device is not set correctly"
+        self.attribute_tokens = self.cfg.attribute_tokens
         self.owned_modules: set[str] = set()
         self.module_to_rank: dict[str, int] = {}
 
@@ -121,83 +117,16 @@ class GradientCollectorWithDistributedPreconditioners(HookCollectorBase):
 
     @HookCollectorBase.split_attention_heads
     def backward_hook(self, module: nn.Module, g: Float[Tensor, "N S O"]):
-        """
-        Compute per-sample gradient and store in mod_grads.
-
-        Computes gradient as outer product g.T @ a (again with optional projection and
-        normalization).
-        """
-        a = module._inputs  # [N, S, I/q]
-
-        assert isinstance(a, torch.Tensor), "Activation cache missing for module"
-        name = assert_type(str, module._name)
-        p = self.processor.projection_dim
-        i = getattr(module, LayerAdapter.in_attr(module))
-        o = getattr(module, LayerAdapter.out_attr(module))
-        normalizer = self.processor.normalizers.get(name)
-
-        if isinstance(normalizer, AdamNormalizer):
-            P = g.mT @ a  # [N, O, S] @ [N, S, I] → [N, O, I]
-            P = normalizer.normalize_(P)
-
-            if module._has_bias and normalizer.bias_avg_sq is not None:
-                bias_grad = g.sum(dim=1) / normalizer.bias_avg_sq.sqrt().add(1e-8)
-                P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)  # [N, O, I+1]
-                i += 1
-
-            if p is not None:
-                g_projection = self.projection(name, p, o, "left", g.device, g.dtype)
-                a_projection = self.projection(name, p, i, "right", g.device, g.dtype).T
-                P = g_projection @ P @ a_projection
-        else:
-            if isinstance(normalizer, AdafactorNormalizer):
-                bias_grad = None
-                if module._has_bias and normalizer.bias_avg_sq is not None:
-                    bias_grad = (
-                        g.sum(dim=1) * normalizer.bias_avg_sq.add(1e-30).rsqrt()
-                    )  # [N, O]
-
-                # Apply row normalization to g (for weights)
-                g_factor = normalizer.row.add(1e-30)
-                g_factor = g_factor.mean().sqrt() * g_factor.rsqrt()
-                g = g * g_factor.type_as(g)  # [N, S, O] * [O] → [N, S, O]
-
-                if bias_grad is not None:
-                    P = g.mT @ a  # [N, O, I]
-                    P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)  # [N, O, I+1]
-                    i += 1
-                    if p is not None:
-                        g_projection = self.projection(
-                            name, p, o, "left", g.device, g.dtype
-                        )
-                        a_projection = self.projection(
-                            name, p, i, "right", a.device, a.dtype
-                        ).T
-                        P = g_projection @ P @ a_projection
-                else:
-                    if p is not None:
-                        g_projection = self.projection(
-                            name, p, o, "left", g.device, g.dtype
-                        )
-                        g = g @ g_projection.T  # [N, S, p]
-                    P = g.mT @ a  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
-            else:
-                # No normalizer
-                if p is not None:
-                    g_projection = self.projection(
-                        name, p, o, "left", g.device, g.dtype
-                    )
-                    g = g @ g_projection.T  # [N, S, p]
-                P = g.mT @ a  # [N, O/p, I(+1)/p]
-
-        P = P.flatten(1).clamp_(self.lo, self.hi)
+        """Compute per-sample gradient and store for distributed
+        preconditioner exchange."""
+        name: str = module._name  # type: ignore[assignment]
+        P = self._compute_gradient(module, g)
 
         # Keep gradients in original dtype for preconditioner computation
         self.mod_grads[name] = P
 
         if self.cfg.skip_preconditioners:
             if self.save_index:
-                # Asynchronously move the gradient to CPU and convert to the final dtype
                 self.mod_grads[name] = P.to(
                     device="cpu", dtype=self.save_dtype, non_blocking=True
                 )
