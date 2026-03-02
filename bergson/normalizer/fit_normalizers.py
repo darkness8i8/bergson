@@ -1,4 +1,3 @@
-import math
 import random
 from dataclasses import dataclass, field
 
@@ -18,7 +17,6 @@ from bergson.gradients import (
     GradientProcessor,
     Normalizer,
 )
-from bergson.process_preconditioners import process_preconditioners
 from bergson.utils.utils import assert_type, get_gradient_dtype
 
 
@@ -131,18 +129,28 @@ class NormalizerCollector(HookCollectorBase):
         """Process collected gradients for a batch."""
 
     def teardown(self):
-        """
-        Finalize normalizer collection.
-        """
-        grad_sizes = {name: math.prod(s) for name, s in self.shapes().items()}
-        if self.processor.preconditioners:
-            process_preconditioners(
-                self.processor,
-                self.processor.preconditioners,
-                len(self.data),
-                grad_sizes,
-                self.rank,
-            )
+        """Finalize normalizer collection: average across samples and ranks."""
+        # Divide by the number of documents processed and average across ranks
+        for normalizer in self.normalizers.values():
+            if isinstance(normalizer, AdamNormalizer):
+                normalizer.weight_avg_sq.div_(len(self.data))
+                if dist.is_initialized():
+                    dist.all_reduce(normalizer.weight_avg_sq, op=dist.ReduceOp.AVG)
+            elif isinstance(normalizer, AdafactorNormalizer):
+                normalizer.row.div_(len(self.data))
+                normalizer.col.div_(len(self.data))
+                if dist.is_initialized():
+                    dist.all_reduce(normalizer.row, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(normalizer.col, op=dist.ReduceOp.AVG)
+
+        # Post-process bias accumulators
+        for name, normalizer in self.normalizers.items():
+            if name in self._bias_accumulators:
+                bias_sq = self._bias_accumulators[name]
+                bias_sq.div_(len(self.data))
+                if dist.is_initialized():
+                    dist.all_reduce(bias_sq, op=dist.ReduceOp.AVG)
+                normalizer.bias_avg_sq = bias_sq
 
         if self.rank == 0:
             self.processor.save(self.cfg.partial_run_path)
@@ -180,31 +188,4 @@ def fit_normalizers(
     )
     computer.run_with_collector_hooks(desc="Estimating normalizers")
 
-    normalizers = collector.normalizers
-
-    # Divide by the number of documents processed and average across all ranks
-    for normalizer in normalizers.values():
-        if isinstance(normalizer, AdamNormalizer):
-            normalizer.weight_avg_sq.div_(len(data))
-
-            if dist.is_initialized():
-                dist.all_reduce(normalizer.weight_avg_sq, op=dist.ReduceOp.AVG)
-
-        elif isinstance(normalizer, AdafactorNormalizer):
-            normalizer.row.div_(len(data))
-            normalizer.col.div_(len(data))
-
-            if dist.is_initialized():
-                dist.all_reduce(normalizer.row, op=dist.ReduceOp.AVG)
-                dist.all_reduce(normalizer.col, op=dist.ReduceOp.AVG)
-
-    # Post-process bias accumulators
-    for name, normalizer in normalizers.items():
-        if name in collector._bias_accumulators:
-            bias_sq = collector._bias_accumulators[name]
-            bias_sq.div_(len(data))
-            if dist.is_initialized():
-                dist.all_reduce(bias_sq, op=dist.ReduceOp.AVG)
-            normalizer.bias_avg_sq = bias_sq
-
-    return normalizers
+    return collector.normalizers
