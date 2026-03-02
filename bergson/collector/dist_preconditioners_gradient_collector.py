@@ -63,12 +63,6 @@ class GradientCollectorWithDistributedPreconditioners(HookCollectorBase):
         assert isinstance(
             self.model.device, torch.device
         ), "Model device is not set correctly"
-        if self.cfg.include_bias and self.processor.normalizers is not None:
-            raise NotImplementedError(
-                "Bias with normalizers not supported yet, "
-                "consider disabling bias inclusion for now."
-            )
-
         self.owned_modules: set[str] = set()
         self.module_to_rank: dict[str, int] = {}
 

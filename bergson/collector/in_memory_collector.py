@@ -75,12 +75,6 @@ class InMemoryCollector(HookCollectorBase):
         assert isinstance(
             self.model.device, torch.device
         ), "Model device is not set correctly"
-        if self.cfg.include_bias and self.processor.normalizers is not None:
-            raise NotImplementedError(
-                "Bias with normalizers not supported yet, "
-                "consider disabling bias inclusion."
-            )
-
         if self.cfg.attribute_tokens:
             assert self.reduce_cfg is None, (
                 "attribute_tokens is incompatible" " with reduce mode."
@@ -161,7 +155,9 @@ class InMemoryCollector(HookCollectorBase):
             a_factor = a_factor.rsqrt()
             a = a * a_factor.type_as(a)
 
-        if module._has_bias:
+        # For normalizer cases, bias normalization differs from weight normalization,
+        # so we handle bias separately in backward hook
+        if module._has_bias and normalizer is None:
             ones = torch.ones(
                 a.size(0),
                 a.size(1),
@@ -172,7 +168,7 @@ class InMemoryCollector(HookCollectorBase):
             a = torch.cat([a, ones], dim=-1)
             i = i + 1
             setattr(module, LayerAdapter.in_attr(module), i)
-        if p is not None:
+        if p is not None and (normalizer is None or not module._has_bias):
             a_proj = self.projection(name, p, i, "right", a.device, a.dtype).T
             a = a @ a_proj
         module._inputs = a
@@ -197,11 +193,18 @@ class InMemoryCollector(HookCollectorBase):
         o = getattr(module, LayerAdapter.out_attr(module))
         normalizer = self.processor.normalizers.get(name)
 
+        bias_grad = None
+
         if isinstance(normalizer, AdamNormalizer):
             if self.cfg.attribute_tokens:
                 # Per-position outer product: [N,S,O,1]*[N,S,1,I] → [N,S,O,I]
                 P = g.unsqueeze(-1) * a.unsqueeze(-2)
                 P = normalizer.normalize_(P)  # broadcasts [O,I] over [N,S,O,I]
+                if module._has_bias and normalizer.bias_avg_sq is not None:
+                    # Per-token bias: [N, S, O] / [O] → [N, S, O]
+                    bias_col = g / normalizer.bias_avg_sq.sqrt().add(1e-8)
+                    P = torch.cat([P, bias_col.unsqueeze(-1)], dim=-1)
+                    i += 1
                 if p is not None:
                     g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
                     a_proj = self.projection(name, p, i, "right", g.device, g.dtype).T
@@ -211,30 +214,90 @@ class InMemoryCollector(HookCollectorBase):
             else:
                 full_gradient = g.mT @ a
                 P = normalizer.normalize_(full_gradient)
+                if module._has_bias and normalizer.bias_avg_sq is not None:
+                    bias_grad = (
+                        g.sum(dim=1) / normalizer.bias_avg_sq.sqrt().add(1e-8)
+                    )
+                    P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)
+                    i += 1
                 if p is not None:
                     g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
                     a_proj = self.projection(name, p, i, "right", g.device, g.dtype).T
                     P = g_proj @ P @ a_proj
         else:
             if isinstance(normalizer, AdafactorNormalizer):
+                bias_per_token = None
+                if module._has_bias and normalizer.bias_avg_sq is not None:
+                    # Compute bias from RAW g (before row normalization)
+                    if self.cfg.attribute_tokens:
+                        bias_per_token = (
+                            g * normalizer.bias_avg_sq.add(1e-30).rsqrt()
+                        )  # [N, S, O]
+                    else:
+                        bias_grad = (
+                            g.sum(dim=1)
+                            * normalizer.bias_avg_sq.add(1e-30).rsqrt()
+                        )  # [N, O]
+
+                # Apply row normalization to g (for weights)
                 g_factor = normalizer.row.add(1e-30)
                 g_factor = g_factor.mean().sqrt() * g_factor.rsqrt()
                 g = g * g_factor.type_as(g)
 
-            if p is not None:
-                g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
-                g = g @ g_proj.T
+                if self.cfg.attribute_tokens:
+                    # [N, S, O, 1] * [N, S, 1, I] → [N, S, O, I]
+                    P = g.unsqueeze(-1) * a.unsqueeze(-2)
+                    if bias_per_token is not None:
+                        P = torch.cat(
+                            [P, bias_per_token.unsqueeze(-1)], dim=-1
+                        )  # [N, S, O, I+1]
+                        i += 1
+                    if p is not None:
+                        g_proj = self.projection(
+                            name, p, o, "left", g.device, g.dtype
+                        )
+                        a_proj = self.projection(
+                            name, p, i, "right", a.device, a.dtype
+                        ).T
+                        P = g_proj @ P @ a_proj
+                    P = P.flatten(2)  # [N, S, grad_dim]
+                    P = P[self._current_valid_mask]  # [total_valid, grad_dim]
+                elif bias_grad is not None:
+                    P = g.mT @ a
+                    P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)
+                    i += 1
+                    if p is not None:
+                        g_proj = self.projection(
+                            name, p, o, "left", g.device, g.dtype
+                        )
+                        a_proj = self.projection(
+                            name, p, i, "right", a.device, a.dtype
+                        ).T
+                        P = g_proj @ P @ a_proj
+                else:
+                    if p is not None:
+                        g_proj = self.projection(
+                            name, p, o, "left", g.device, g.dtype
+                        )
+                        g = g @ g_proj.T
 
-            if self.cfg.attribute_tokens:
-                # Per-position outer product
-                # [N,S,O/p,1]*[N,S,1,I/q] -> [N,S,O/p,I/q]
-                P = g.unsqueeze(-1) * a.unsqueeze(-2)
-                P = P.flatten(2)
-
-                # Filter to valid positions
-                P = P[self._current_valid_mask]
+                    P = g.mT @ a
             else:
-                P = g.mT @ a
+                # No normalizer
+                if p is not None:
+                    g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
+                    g = g @ g_proj.T
+
+                if self.cfg.attribute_tokens:
+                    # Per-position outer product
+                    # [N,S,O/p,1]*[N,S,1,I/q] -> [N,S,O/p,I/q]
+                    P = g.unsqueeze(-1) * a.unsqueeze(-2)
+                    P = P.flatten(2)
+
+                    # Filter to valid positions
+                    P = P[self._current_valid_mask]
+                else:
+                    P = g.mT @ a
 
         P = P.flatten(1).clamp_(self.lo, self.hi)
 

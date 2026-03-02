@@ -152,14 +152,15 @@ class GradientCollector(HookCollectorBase):
         bias_grad = None
 
         if isinstance(normalizer, AdamNormalizer):
-            if module._has_bias and normalizer.bias_avg_sq is not None:
-                # Normalize bias with bias second moments [N, S, O] → [N, O]
-                bias_grad = g.sum(dim=1) / normalizer.bias_avg_sq.sqrt().add(1e-8)
-
             if self.cfg.attribute_tokens:
                 # Per-position outer product: [N,S,O,1]*[N,S,1,I] → [N,S,O,I]
                 P = g.unsqueeze(-1) * a.unsqueeze(-2)
                 P = normalizer.normalize_(P)  # broadcasts [O,I] over [N,S,O,I]
+                if module._has_bias and normalizer.bias_avg_sq is not None:
+                    # Per-token bias: [N, S, O] / [O] → [N, S, O]
+                    bias_col = g / normalizer.bias_avg_sq.sqrt().add(1e-8)
+                    P = torch.cat([P, bias_col.unsqueeze(-1)], dim=-1)
+                    i += 1
                 if p is not None:
                     g_projection = self.projection(
                         name, p, o, "left", g.device, g.dtype
@@ -174,8 +175,8 @@ class GradientCollector(HookCollectorBase):
                 P = g.mT @ a  # [N, O, S] @ [N, S, I] → [N, O, I]
                 P = normalizer.normalize_(P)
 
-                # Append pre-normalized bias gradient
-                if bias_grad is not None:
+                if module._has_bias and normalizer.bias_avg_sq is not None:
+                    bias_grad = g.sum(dim=1) / normalizer.bias_avg_sq.sqrt().add(1e-8)
                     P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)  # [N, O, I+1]
                     i += 1
 
@@ -189,19 +190,42 @@ class GradientCollector(HookCollectorBase):
                     P = g_projection @ P @ a_projection
         else:
             if isinstance(normalizer, AdafactorNormalizer):
+                bias_per_token = None
                 if module._has_bias and normalizer.bias_avg_sq is not None:
                     # Compute bias from RAW g (before row normalization)
-                    bias_grad = g.sum(dim=1)  # [N, S, O] → [N, O]
-                    # Normalize bias with bias second moments
-                    bias_grad = bias_grad / normalizer.bias_avg_sq.add(1e-30).sqrt()
+                    if self.cfg.attribute_tokens:
+                        bias_per_token = (
+                            g * normalizer.bias_avg_sq.add(1e-30).rsqrt()
+                        )  # [N, S, O]
+                    else:
+                        bias_grad = (
+                            g.sum(dim=1) * normalizer.bias_avg_sq.add(1e-30).rsqrt()
+                        )  # [N, O]
 
                 # Apply row normalization to g (for weights)
                 g_factor = normalizer.row.add(1e-30)
                 g_factor = g_factor.mean().sqrt() * g_factor.rsqrt()
                 g = g * g_factor.type_as(g)  # [N, S, O] * [O] → [N, S, O]
 
-                # If bias is present, materialize full gradient then project
-                if bias_grad is not None:
+                if self.cfg.attribute_tokens:
+                    # [N, S, O, 1] * [N, S, 1, I] → [N, S, O, I]
+                    P = g.unsqueeze(-1) * a.unsqueeze(-2)
+                    if bias_per_token is not None:
+                        P = torch.cat(
+                            [P, bias_per_token.unsqueeze(-1)], dim=-1
+                        )  # [N, S, O, I+1]
+                        i += 1
+                    if p is not None:
+                        g_projection = self.projection(
+                            name, p, o, "left", g.device, g.dtype
+                        )
+                        a_projection = self.projection(
+                            name, p, i, "right", a.device, a.dtype
+                        ).T
+                        P = g_projection @ P @ a_projection
+                    P = P.flatten(2)  # [N, S, grad_dim]
+                    P = P[self._current_valid_mask]  # [total_valid, grad_dim]
+                elif bias_grad is not None:
                     P = g.mT @ a  # [N, O, I]
 
                     # Append pre-normalized bias gradient
@@ -224,13 +248,7 @@ class GradientCollector(HookCollectorBase):
                         )
                         g = g @ g_projection.T  # [N, S, p]
 
-                    if self.cfg.attribute_tokens:
-                        # [N, S, O/p, 1] * [N, S, 1, I/q] → [N, S, O/p, I/q]
-                        P = g.unsqueeze(-1) * a.unsqueeze(-2)
-                        P = P.flatten(2)  # [N, S, grad_dim]
-                        P = P[self._current_valid_mask]  # [total_valid, grad_dim]
-                    else:
-                        P = g.mT @ a  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
+                    P = g.mT @ a  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
             else:
                 # No normalizer
                 if p is not None:

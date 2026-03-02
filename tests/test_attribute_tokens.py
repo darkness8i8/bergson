@@ -462,7 +462,13 @@ def test_token_build_adam_e2e(tmp_path: Path, model, dataset):
 
 
 def _collect_in_memory(
-    model, dataset, processor, target_modules, attribute_tokens, run_path
+    model,
+    dataset,
+    processor,
+    target_modules,
+    attribute_tokens,
+    run_path,
+    include_bias=False,
 ):
     """Run InMemoryCollector and return the collector for inspection."""
     cfg = IndexConfig(
@@ -472,6 +478,7 @@ def _collect_in_memory(
         attribute_tokens=attribute_tokens,
         loss_reduction="sum",
         skip_index=True,
+        include_bias=include_bias,
     )
     cfg.partial_run_path.mkdir(parents=True, exist_ok=True)
     collector = InMemoryCollector(
@@ -494,7 +501,10 @@ def _collect_in_memory(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("normalizer", ["none", "adam", "adafactor"])
-def test_token_sum_equals_sequence(tmp_path, model, dataset, normalizer):
+@pytest.mark.parametrize("include_bias", [False, True])
+def test_token_sum_equals_sequence(
+    tmp_path, model, dataset, normalizer, include_bias
+):
     """Sum of per-token grads must equal the per-example sequence grad.
 
     With loss_reduction='sum' the sequence path computes g.mT @ a which
@@ -503,6 +513,14 @@ def test_token_sum_equals_sequence(tmp_path, model, dataset, normalizer):
     """
     model = model.float()
     dataset = dataset.repeat(10)
+
+    # tiny-Phi3 has no bias on Linear layers; add zero bias when testing bias
+    if include_bias:
+        for m in model.base_model.modules():
+            if isinstance(m, torch.nn.Linear) and m.bias is None:
+                m.bias = torch.nn.Parameter(
+                    torch.zeros(m.out_features, device=m.weight.device)
+                )
 
     target_modules = {
         name
@@ -527,7 +545,9 @@ def test_token_sum_equals_sequence(tmp_path, model, dataset, normalizer):
             target_modules=target_modules,
         )
 
-    processor = GradientProcessor(normalizers=normalizers)
+    processor = GradientProcessor(
+        normalizers=normalizers, include_bias=include_bias
+    )
 
     # --- Sequence grads (attribute_tokens=False) ---
     seq_collector = _collect_in_memory(
@@ -537,6 +557,7 @@ def test_token_sum_equals_sequence(tmp_path, model, dataset, normalizer):
         target_modules,
         attribute_tokens=False,
         run_path=str(tmp_path / "seq"),
+        include_bias=include_bias,
     )
     # seq_collector.gradients: {module_name: [N, grad_dim]}
 
@@ -548,6 +569,7 @@ def test_token_sum_equals_sequence(tmp_path, model, dataset, normalizer):
         target_modules,
         attribute_tokens=True,
         run_path=str(tmp_path / "tok"),
+        include_bias=include_bias,
     )
     # tok_collector.builder.grad_buffer: [total_tokens, total_grad_dim]
 
