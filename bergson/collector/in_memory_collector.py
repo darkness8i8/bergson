@@ -245,21 +245,31 @@ class InMemoryCollector(HookCollectorBase):
                 g = g * g_factor.type_as(g)
 
                 if self.cfg.attribute_tokens:
-                    # [N, S, O, 1] * [N, S, 1, I] → [N, S, O, I]
-                    P = g.unsqueeze(-1) * a.unsqueeze(-2)
                     if bias_per_token is not None:
+                        # a was NOT projected in forward (bias needs combined projection)
+                        # [N, S, O, 1] * [N, S, 1, I] → [N, S, O, I]
+                        P = g.unsqueeze(-1) * a.unsqueeze(-2)
                         P = torch.cat(
                             [P, bias_per_token.unsqueeze(-1)], dim=-1
                         )  # [N, S, O, I+1]
                         i += 1
-                    if p is not None:
-                        g_proj = self.projection(
-                            name, p, o, "left", g.device, g.dtype
-                        )
-                        a_proj = self.projection(
-                            name, p, i, "right", a.device, a.dtype
-                        ).T
-                        P = g_proj @ P @ a_proj
+                        if p is not None:
+                            g_proj = self.projection(
+                                name, p, o, "left", g.device, g.dtype
+                            )
+                            a_proj = self.projection(
+                                name, p, i, "right", a.device, a.dtype
+                            ).T
+                            P = g_proj @ P @ a_proj
+                    else:
+                        # a was already projected in forward; project g individually
+                        if p is not None:
+                            g_proj = self.projection(
+                                name, p, o, "left", g.device, g.dtype
+                            )
+                            g = g @ g_proj.T
+                        # [N, S, O/p, 1] * [N, S, 1, I/q] → [N, S, O/p, I/q]
+                        P = g.unsqueeze(-1) * a.unsqueeze(-2)
                     P = P.flatten(2)  # [N, S, grad_dim]
                     P = P[self._current_valid_mask]  # [total_valid, grad_dim]
                 elif bias_grad is not None:
