@@ -88,10 +88,10 @@ class HookCollectorBase(ContextDecorator, ABC):
     to valid positions using ``_current_valid_mask``."""
 
     lo: float = float("-inf")
-    """Lower clamp bound for gradients. Set by subclass ``setup()``."""
+    """Lower clamp bound for gradients. May be narrowed in subclass ``setup()``."""
 
     hi: float = float("inf")
-    """Upper clamp bound for gradients. Set by subclass ``setup()``."""
+    """Upper clamp bound for gradients. May be narrowed in subclass ``setup()``."""
 
     logger = get_logger("HookCollectorBase", level="INFO")
 
