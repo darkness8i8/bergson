@@ -506,3 +506,149 @@ def test_gradient_collector_with_projection(
         torch.testing.assert_close(
             collected, collected2, msg=f"Gradients not deterministic for {layer_name}"
         )
+
+
+@pytest.mark.parametrize("include_bias", [False, True])
+def test_adafactor_normalization_ground_truth(
+    include_bias: bool, trained_model_with_normalizers, test_params
+):
+    """Test A: Adafactor normalization matches manually-applied factored second moments.
+
+    Converts Adam second moments to Adafactor (rank-1), then compares:
+    - Ground truth: per-sample backward + manual Adafactor normalization
+    - Collected: GradientCollector with Adafactor normalizers
+
+    Test B (include_bias=True): same but also verifies bias column is normalized
+    by bias_avg_sq.
+    """
+    temp_dir = Path(tempfile.mkdtemp())
+    N, S, I = test_params["N"], test_params["S"], test_params["I"]
+
+    model, adam_normalizers = trained_model_with_normalizers(include_bias)
+
+    # Convert Adam → Adafactor, preserving bias_avg_sq
+    adafactor_normalizers = {
+        name: norm.to_adafactor() for name, norm in adam_normalizers.items()
+    }
+
+    dummy_data = Dataset.from_dict({"input_ids": [[1] * 10] * N})
+    cfg = IndexConfig(
+        run_path=str(temp_dir / "run"),
+        skip_index=True,
+    )
+
+    processor = GradientProcessor(
+        normalizers=adafactor_normalizers,
+        projection_dim=None,
+        include_bias=include_bias,
+    )
+    collector = GradientCollector(
+        model=model,
+        cfg=cfg,
+        data=dummy_data,
+        processor=processor,
+        target_modules={"fc1", "fc2"},
+    )
+
+    x = torch.randn(N, S, I)
+    with collector:
+        model.zero_grad()
+        out = model(x)
+        loss = (out**2).sum()
+        loss.backward()
+
+    collected_grads = collector.mod_grads.copy()
+
+    # Compute ground truth via individual backward passes
+    model.zero_grad()
+    output = model(x)
+    per_sample_losses = (output**2).sum(dim=(1, 2))
+
+    ground_truth_grads = defaultdict(list)
+    for n in range(N):
+        model.zero_grad()
+        per_sample_losses[n].backward(retain_graph=True)
+
+        for layer_name in ["fc1", "fc2"]:
+            layer = model.get_submodule(layer_name)
+            norm = adafactor_normalizers[layer_name]
+            grad = layer.weight.grad.clone()
+
+            # Apply Adafactor normalization manually:
+            # row factor: sqrt(mean(row)) / sqrt(row)
+            # col factor: 1/sqrt(col)
+            r = norm.row.add(1e-30)
+            c = norm.col.add(1e-30)
+            row_factor = r.mean().sqrt() * r.rsqrt()  # [O]
+            col_factor = c.rsqrt()  # [I]
+            grad = grad * row_factor[:, None] * col_factor[None, :]
+
+            if include_bias:
+                bias_grad = layer.bias.grad.clone()
+                bias_grad = bias_grad * norm.bias_avg_sq.add(1e-30).rsqrt()
+                grad = torch.cat([grad, bias_grad.unsqueeze(1)], dim=1)
+
+            ground_truth_grads[layer_name].append(grad.flatten())
+
+    for layer_name in ["fc1", "fc2"]:
+        gt = torch.stack(ground_truth_grads[layer_name])
+        torch.testing.assert_close(
+            collected_grads[layer_name],
+            gt,
+            atol=1e-4,
+            rtol=1e-4,
+            msg=f"Adafactor normalization mismatch for {layer_name}",
+        )
+
+
+def test_in_features_restored_after_collector(test_params, simple_model_class):
+    """Test E: module.in_features is restored after collector context exits.
+
+    Verifies that the collector doesn't permanently mutate module metadata
+    (like in_features) when appending bias columns during forward hooks.
+    """
+    temp_dir = Path(tempfile.mkdtemp())
+    N, S, I = test_params["N"], test_params["S"], test_params["I"]
+
+    ModelClass = simple_model_class(include_bias=True, num_layers=2)
+    model = ModelClass().to("cpu")
+
+    dummy_data = Dataset.from_dict({"input_ids": [[1] * 10] * N})
+    cfg = IndexConfig(
+        run_path=str(temp_dir / "run"),
+        skip_index=True,
+    )
+
+    # Record original in_features for all layers
+    original_in_features = {}
+    for name, layer in model.named_modules():
+        if isinstance(layer, nn.Linear):
+            original_in_features[name] = layer.in_features
+
+    # Run collector with include_bias=True and NO normalizer (triggers ones-appending)
+    processor = GradientProcessor(include_bias=True, projection_dim=None)
+    collector = GradientCollector(
+        model=model,
+        cfg=cfg,
+        data=dummy_data,
+        processor=processor,
+        target_modules=set(original_in_features.keys()),
+    )
+
+    x = torch.randn(N, S, I)
+
+    # Run multiple batches to ensure in_features doesn't accumulate
+    for _ in range(3):
+        with collector:
+            model.zero_grad()
+            out = model(x)
+            loss = (out**2).sum()
+            loss.backward()
+
+    # Verify in_features is restored
+    for name, layer in model.named_modules():
+        if isinstance(layer, nn.Linear):
+            assert layer.in_features == original_in_features[name], (
+                f"{name}.in_features changed from {original_in_features[name]} "
+                f"to {layer.in_features} after collector context"
+            )

@@ -136,50 +136,6 @@ class InMemoryCollector(HookCollectorBase):
         if self.scorer is not None:
             self.scores = self.scorer.writer.scores
 
-    def forward_hook(
-        self,
-        module: nn.Module,
-        a: Float[Tensor, "N S I"],
-    ) -> None:
-        """Cache activations for gradient computation."""
-        p = self.processor.projection_dim
-        name = assert_type(str, module._name)
-        i = getattr(module, LayerAdapter.in_attr(module))
-        normalizer = self.processor.normalizers.get(name)
-
-        if isinstance(normalizer, AdamNormalizer):
-            module._inputs = a
-            return
-        if isinstance(normalizer, AdafactorNormalizer):
-            a_factor = normalizer.col.add(1e-30)
-            a_factor = a_factor.rsqrt()
-            a = a * a_factor.type_as(a)
-
-        # For normalizer cases, bias normalization differs from weight normalization,
-        # so we handle bias separately in backward hook
-        if module._has_bias and normalizer is None:
-            ones = torch.ones(
-                a.size(0),
-                a.size(1),
-                1,
-                device=a.device,
-                dtype=a.dtype,
-            )
-            a = torch.cat([a, ones], dim=-1)
-            i = i + 1
-            setattr(module, LayerAdapter.in_attr(module), i)
-        # Only defer a-projection when the normalizer will handle bias in backward
-        # (i.e., bias_avg_sq is populated). Otherwise project a now.
-        _defer_proj = (
-            module._has_bias
-            and normalizer is not None
-            and normalizer.bias_avg_sq is not None
-        )
-        if p is not None and not _defer_proj:
-            a_proj = self.projection(name, p, i, "right", a.device, a.dtype).T
-            a = a @ a_proj
-        module._inputs = a
-
     @HookCollectorBase.split_attention_heads
     def backward_hook(
         self,
@@ -250,7 +206,7 @@ class InMemoryCollector(HookCollectorBase):
 
                 if self.cfg.attribute_tokens:
                     if bias_per_token is not None:
-                        # a was NOT projected in forward (bias needs combined projection)
+                        # a was NOT projected in forward (bias needs combined proj)
                         # [N, S, O, 1] * [N, S, 1, I] → [N, S, O, I]
                         P = g.unsqueeze(-1) * a.unsqueeze(-2)
                         P = torch.cat(

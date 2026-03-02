@@ -29,11 +29,14 @@ from transformers import PreTrainedModel
 from bergson.config import AttentionConfig, HessianConfig, IndexConfig
 from bergson.data import pad_and_tensor
 from bergson.gradients import (
+    AdafactorNormalizer,
+    AdamNormalizer,
     GradientProcessor,
     LayerAdapter,
 )
 from bergson.utils.logger import get_logger
 from bergson.utils.peft import set_peft_enabled
+from bergson.utils.utils import assert_type
 
 
 @dataclass
@@ -105,6 +108,20 @@ class HookCollectorBase(ContextDecorator, ABC):
                 f"attention_cfgs contains module names not found in the model: "
                 f"{unknown}. Available modules: {set(self.target_info)}"
             )
+
+        # Validate that normalizers have bias_avg_sq when bias collection is enabled
+        if self.processor.include_bias and self.processor.normalizers:
+            for name, (_, _, has_bias) in self.target_info.items():
+                if not has_bias:
+                    continue
+                normalizer = self.processor.normalizers.get(name)
+                if normalizer is not None and normalizer.bias_avg_sq is None:
+                    raise ValueError(
+                        f"Module '{name}' has bias and include_bias=True, but its "
+                        f"normalizer ({type(normalizer).__name__}) has no bias_avg_sq. "
+                        f"Fit normalizers with include_bias=True or provide "
+                        f"bias_avg_sq from optimizer state."
+                    )
 
         # Allow subclasses to perform custom initialization
         self.setup()
@@ -329,6 +346,12 @@ class HookCollectorBase(ContextDecorator, ABC):
     def __exit__(self, exc_type, exc, tb):
         """Clean up hooks and allow subclass cleanup."""
 
+        # Restore in_features for modules where bias appending incremented it
+        for name, (_, target_shape, has_bias) in self.target_info.items():
+            if has_bias:
+                layer = self.model.get_submodule(name)
+                setattr(layer, LayerAdapter.in_attr(layer), target_shape[-1])
+
         # Clean up temporary attributes
         for layer in self.model.modules():
             if hasattr(layer, "_inputs"):
@@ -371,18 +394,45 @@ class HookCollectorBase(ContextDecorator, ABC):
         """
         pass
 
-    @abstractmethod
     def forward_hook(self, module: nn.Module, a: Float[Tensor, "N S I"]) -> None:
         """
-        Process activations during the forward pass.
-
-        Args:
-            module: The module whose forward pass triggered this hook. The module name
-                is available via module._name.
-            a: Input activations of shape [N, S, I] where N=batch size, S=sequence
-                length, I=input dimension.
+        Cache activations for gradient computation with normalizer preprocessing
+        and compress via random projection if configured.
+        Stores result in module._inputs for use in backward_hook.
         """
-        pass
+        p = self.processor.projection_dim
+        name = assert_type(str, module._name)
+        i = getattr(module, LayerAdapter.in_attr(module))
+        normalizer = self.processor.normalizers.get(name)
+
+        if isinstance(normalizer, AdamNormalizer):
+            module._inputs = a
+            return
+        if isinstance(normalizer, AdafactorNormalizer):
+            a_factor = normalizer.col.add(1e-30)
+            a_factor = a_factor.rsqrt()
+            a = a * a_factor.type_as(a)  # [N, S, I] * [I] → [N, S, I]
+
+        # For normalizer cases, bias normalization differs from weight normalization,
+        # so we handle bias separately in backward hook
+        if module._has_bias and normalizer is None:
+            ones = torch.ones(a.size(0), a.size(1), 1, device=a.device, dtype=a.dtype)
+            a = torch.cat([a, ones], dim=-1)  # [N, S, I+1]
+            i = i + 1
+            setattr(module, LayerAdapter.in_attr(module), i)
+
+        # Only defer a-projection when the normalizer will handle bias in backward
+        # (i.e., bias_avg_sq is populated). Otherwise project a now.
+        _defer_proj = (
+            module._has_bias
+            and normalizer is not None
+            and normalizer.bias_avg_sq is not None
+        )
+        if p is not None and not _defer_proj:
+            a_projection = self.projection(name, p, i, "right", a.device, a.dtype).T
+            a = a @ a_projection  # [N, S, I(+1)] @ [I(+1), p] → [N, S, p]
+
+        module._inputs = a
 
     @abstractmethod
     def backward_hook(self, module: nn.Module, g: Float[Tensor, "N S O"]) -> None:

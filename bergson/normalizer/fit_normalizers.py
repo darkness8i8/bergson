@@ -15,7 +15,7 @@ from bergson.config import IndexConfig
 from bergson.gradients import (
     AdafactorNormalizer,
     AdamNormalizer,
-    LayerAdapter,
+    GradientProcessor,
     Normalizer,
 )
 from bergson.process_preconditioners import process_preconditioners
@@ -41,6 +41,7 @@ class NormalizerCollector(HookCollectorBase):
     """Configuration for gradient index."""
 
     normalizers: dict[str, Normalizer] = field(default_factory=dict)
+    _bias_accumulators: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def adafactor_update(self, name: str, g: torch.Tensor):
         # We follow the tensor2tensor implementation of Adafactor, which
@@ -96,20 +97,10 @@ class NormalizerCollector(HookCollectorBase):
 
     def forward_hook(self, module: nn.Module, a: Float[Tensor, "N S I"]) -> None:
         """
-        Cache activations for gradient computation with normalizer preprocessing
-        and compress via random projection if configured.
-        Stores result in module._inputs for use in backward_hook.
+        Cache activations for gradient computation.
+        Bias second moments are computed directly from g in backward_hook,
+        so we don't append ones here.
         """
-        i = getattr(module, LayerAdapter.in_attr(module))
-
-        if module._has_bias:
-            # Append ones to activation for bias term
-            ones = torch.ones(a.size(0), a.size(1), 1, device=a.device, dtype=a.dtype)
-            a = torch.cat([a, ones], dim=-1)
-            i = i + 1
-            setattr(module, LayerAdapter.in_attr(module), i)
-
-        # set module._inputs to a
         module._inputs = a
 
     @HookCollectorBase.split_attention_heads
@@ -117,8 +108,8 @@ class NormalizerCollector(HookCollectorBase):
         """
         Compute per-sample gradient and store in mod_grads.
 
-        Computes gradient as outer product g.T @ a (again with optional projection and
-        normalization).
+        Computes gradient as outer product g.T @ a for weights, and accumulates
+        bias second moments directly from g when bias is present.
         """
         a = module._inputs  # [N, S, I/q]
 
@@ -128,6 +119,15 @@ class NormalizerCollector(HookCollectorBase):
         P = g.mT @ a  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
 
         self.callback(name, P)
+
+        if module._has_bias:
+            # bias_grad = g.sum(dim=seq), shape [N, O]
+            # bias_avg_sq = E[bias_grad^2], accumulated as sum then divided later
+            bias_sq = g.sum(dim=1).float().square().sum(0)  # [O]
+            if name in self._bias_accumulators:
+                self._bias_accumulators[name].add_(bias_sq)
+            else:
+                self._bias_accumulators[name] = bias_sq
 
     def process_batch(self, indices: list[int], **kwargs):
         """Process collected gradients for a batch."""
@@ -171,6 +171,7 @@ def fit_normalizers(
         cfg=cfg,
         target_modules=target_modules,
         filter_modules=cfg.filter_modules,
+        processor=GradientProcessor(include_bias=cfg.include_bias),
     )
     computer = CollectorComputer(
         model=model,
@@ -198,5 +199,14 @@ def fit_normalizers(
             if dist.is_initialized():
                 dist.all_reduce(normalizer.row, op=dist.ReduceOp.AVG)
                 dist.all_reduce(normalizer.col, op=dist.ReduceOp.AVG)
+
+    # Post-process bias accumulators
+    for name, normalizer in normalizers.items():
+        if name in collector._bias_accumulators:
+            bias_sq = collector._bias_accumulators[name]
+            bias_sq.div_(len(data))
+            if dist.is_initialized():
+                dist.all_reduce(bias_sq, op=dist.ReduceOp.AVG)
+            normalizer.bias_avg_sq = bias_sq
 
     return normalizers

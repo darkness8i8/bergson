@@ -537,6 +537,7 @@ def test_token_sum_equals_sequence(
             run_path=str(tmp_path / "fit"),
             skip_preconditioners=True,
             normalizer=normalizer,
+            include_bias=include_bias,
         )
         normalizers = fit_normalizers(
             model,

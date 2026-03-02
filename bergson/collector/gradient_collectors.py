@@ -94,46 +94,6 @@ class GradientCollector(HookCollectorBase):
         else:
             self.builder = None
 
-    def forward_hook(self, module: nn.Module, a: Float[Tensor, "N S I"]) -> None:
-        """
-        Cache activations for gradient computation with normalizer preprocessing
-        and compress via random projection if configured.
-        Stores result in module._inputs for use in backward_hook.
-        """
-        p = self.processor.projection_dim
-        name = assert_type(str, module._name)
-        i = getattr(module, LayerAdapter.in_attr(module))
-        normalizer = self.processor.normalizers.get(name)
-
-        if isinstance(normalizer, AdamNormalizer):
-            module._inputs = a
-            return
-        if isinstance(normalizer, AdafactorNormalizer):
-            a_factor = normalizer.col.add(1e-30)
-            a_factor = a_factor.rsqrt()
-            a = a * a_factor.type_as(a)  # [N, S, I] * [I] → [N, S, I]
-
-        # For normalizer cases, bias normalization differs from weight normalization,
-        # so we handle bias separately in backward hook
-        if module._has_bias and normalizer is None:
-            ones = torch.ones(a.size(0), a.size(1), 1, device=a.device, dtype=a.dtype)
-            a = torch.cat([a, ones], dim=-1)  # [N, S, I+1]
-            i = i + 1
-            setattr(module, LayerAdapter.in_attr(module), i)
-
-        # Only defer a-projection when the normalizer will handle bias in backward
-        # (i.e., bias_avg_sq is populated). Otherwise project a now.
-        _defer_proj = (
-            module._has_bias
-            and normalizer is not None
-            and normalizer.bias_avg_sq is not None
-        )
-        if p is not None and not _defer_proj:
-            a_projection = self.projection(name, p, i, "right", a.device, a.dtype).T
-            a = a @ a_projection  # [N, S, I(+1)] @ [I(+1), p] → [N, S, p]
-
-        module._inputs = a
-
     @HookCollectorBase.split_attention_heads
     def backward_hook(self, module: nn.Module, g: Float[Tensor, "N S O"]):
         """
@@ -216,7 +176,7 @@ class GradientCollector(HookCollectorBase):
 
                 if self.cfg.attribute_tokens:
                     if bias_per_token is not None:
-                        # a was NOT projected in forward (bias needs combined projection)
+                        # a was NOT projected in forward (bias needs combined proj)
                         # [N, S, O, 1] * [N, S, 1, I] → [N, S, O, I]
                         P = g.unsqueeze(-1) * a.unsqueeze(-2)
                         P = torch.cat(
@@ -393,37 +353,6 @@ class TraceCollector(HookCollectorBase):
         self.lo = torch.finfo(self.save_dtype).min
         self.hi = torch.finfo(self.save_dtype).max
 
-    def forward_hook(self, module: nn.Module, a: Float[Tensor, "N S I"]) -> None:
-        """
-        Cache activations for gradient computation with normalizer preprocessing
-        and compress via random projection if configured.
-        Stores result in module._inputs for use in backward_hook.
-        """
-        p = self.processor.projection_dim
-        name = assert_type(str, module._name)
-        i = getattr(module, LayerAdapter.in_attr(module))
-        normalizer = self.processor.normalizers.get(name)
-
-        if isinstance(normalizer, AdamNormalizer):
-            module._inputs = a
-            return
-        if isinstance(normalizer, AdafactorNormalizer):
-            a_factor = normalizer.col.add(1e-30)
-            a_factor = a_factor.rsqrt()
-            a = a * a_factor.type_as(a)  # [N, S, I] * [I] → [N, S, I]
-
-        if module._has_bias:
-            # Append ones to activation for bias term
-            ones = torch.ones(a.size(0), a.size(1), 1, device=a.device, dtype=a.dtype)
-            a = torch.cat([a, ones], dim=-1)
-            i = i + 1
-            setattr(module, LayerAdapter.in_attr(module), i)
-        if p is not None:
-            a_projection = self.projection(name, p, i, "right", a.device, a.dtype).T
-            a = a @ a_projection  # type: ignore
-        # set module._inputs to a
-        module._inputs = a
-
     @HookCollectorBase.split_attention_heads
     def backward_hook(self, module: nn.Module, g: Float[Tensor, "N S O"]):
         """
@@ -442,23 +371,58 @@ class TraceCollector(HookCollectorBase):
         normalizer = self.processor.normalizers.get(name)
 
         if isinstance(normalizer, AdamNormalizer):
-            full_gradient = g.mT @ a  # [N, O, S] @ [N, S, I] → [N, O, I]
-            P = normalizer.normalize_(full_gradient)
+            P = g.mT @ a  # [N, O, S] @ [N, S, I] → [N, O, I]
+            P = normalizer.normalize_(P)
+
+            if module._has_bias and normalizer.bias_avg_sq is not None:
+                bias_grad = g.sum(dim=1) / normalizer.bias_avg_sq.sqrt().add(1e-8)
+                P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)  # [N, O, I+1]
+                i += 1
+
             if p is not None:
                 g_projection = self.projection(name, p, o, "left", g.device, g.dtype)
                 a_projection = self.projection(name, p, i, "right", g.device, g.dtype).T
                 P = g_projection @ P @ a_projection
         else:
             if isinstance(normalizer, AdafactorNormalizer):
+                bias_grad = None
+                if module._has_bias and normalizer.bias_avg_sq is not None:
+                    bias_grad = (
+                        g.sum(dim=1) * normalizer.bias_avg_sq.add(1e-30).rsqrt()
+                    )  # [N, O]
+
+                # Apply row normalization to g (for weights)
                 g_factor = normalizer.row.add(1e-30)
                 g_factor = g_factor.mean().sqrt() * g_factor.rsqrt()
                 g = g * g_factor.type_as(g)  # [N, S, O] * [O] → [N, S, O]
 
-            if p is not None:
-                g_projection = self.projection(name, p, o, "left", g.device, g.dtype)
-                g = g @ g_projection.T  # [N, S, p]
-
-            P = g.mT @ a  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
+                if bias_grad is not None:
+                    P = g.mT @ a  # [N, O, I]
+                    P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)  # [N, O, I+1]
+                    i += 1
+                    if p is not None:
+                        g_projection = self.projection(
+                            name, p, o, "left", g.device, g.dtype
+                        )
+                        a_projection = self.projection(
+                            name, p, i, "right", a.device, a.dtype
+                        ).T
+                        P = g_projection @ P @ a_projection
+                else:
+                    if p is not None:
+                        g_projection = self.projection(
+                            name, p, o, "left", g.device, g.dtype
+                        )
+                        g = g @ g_projection.T  # [N, S, p]
+                    P = g.mT @ a  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
+            else:
+                # No normalizer
+                if p is not None:
+                    g_projection = self.projection(
+                        name, p, o, "left", g.device, g.dtype
+                    )
+                    g = g @ g_projection.T  # [N, S, p]
+                P = g.mT @ a  # [N, O/p, I(+1)/p]
 
         P = P.flatten(1).clamp_(self.lo, self.hi)
 
@@ -506,37 +470,6 @@ class StreamingGradientCollector(HookCollectorBase):
     def process_batch(self, indices: list[int], **kwargs) -> None:
         pass
 
-    def forward_hook(self, module: nn.Module, a: Float[Tensor, "N S I"]) -> None:
-        """
-        Cache activations for gradient computation with normalizer preprocessing
-        and compress via random projection if configured.
-        Stores result in module._inputs for use in backward_hook.
-        """
-        p = self.processor.projection_dim
-        name = assert_type(str, module._name)
-        i = getattr(module, LayerAdapter.in_attr(module))
-        normalizer = self.processor.normalizers.get(name)
-
-        if isinstance(normalizer, AdamNormalizer):
-            module._inputs = a
-            return
-        if isinstance(normalizer, AdafactorNormalizer):
-            a_factor = normalizer.col.add(1e-30)
-            a_factor = a_factor.rsqrt()
-            a = a * a_factor.type_as(a)  # [N, S, I] * [I] → [N, S, I]
-
-        if module._has_bias:
-            # Append ones to activation for bias term
-            ones = torch.ones(a.size(0), a.size(1), 1, device=a.device, dtype=a.dtype)
-            a = torch.cat([a, ones], dim=-1)
-            i = i + 1
-            setattr(module, LayerAdapter.in_attr(module), i)
-        if p is not None:
-            a_projection = self.projection(name, p, i, "right", a.device, a.dtype).T
-            a = a @ a_projection  # type: ignore
-        # set module._inputs to a
-        module._inputs = a
-
     @HookCollectorBase.split_attention_heads
     def backward_hook(self, module: nn.Module, g: Float[Tensor, "N S O"]):
         """
@@ -555,23 +488,58 @@ class StreamingGradientCollector(HookCollectorBase):
         normalizer = self.processor.normalizers.get(name)
 
         if isinstance(normalizer, AdamNormalizer):
-            full_gradient = g.mT @ a  # [N, O, S] @ [N, S, I] → [N, O, I]
-            P = normalizer.normalize_(full_gradient)
+            P = g.mT @ a  # [N, O, S] @ [N, S, I] → [N, O, I]
+            P = normalizer.normalize_(P)
+
+            if module._has_bias and normalizer.bias_avg_sq is not None:
+                bias_grad = g.sum(dim=1) / normalizer.bias_avg_sq.sqrt().add(1e-8)
+                P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)  # [N, O, I+1]
+                i += 1
+
             if p is not None:
                 g_projection = self.projection(name, p, o, "left", g.device, g.dtype)
                 a_projection = self.projection(name, p, i, "right", g.device, g.dtype).T
                 P = g_projection @ P @ a_projection
         else:
             if isinstance(normalizer, AdafactorNormalizer):
+                bias_grad = None
+                if module._has_bias and normalizer.bias_avg_sq is not None:
+                    bias_grad = (
+                        g.sum(dim=1) * normalizer.bias_avg_sq.add(1e-30).rsqrt()
+                    )  # [N, O]
+
+                # Apply row normalization to g (for weights)
                 g_factor = normalizer.row.add(1e-30)
                 g_factor = g_factor.mean().sqrt() * g_factor.rsqrt()
                 g = g * g_factor.type_as(g)  # [N, S, O] * [O] → [N, S, O]
 
-            if p is not None:
-                g_projection = self.projection(name, p, o, "left", g.device, g.dtype)
-                g = g @ g_projection.T  # [N, S, p]
-
-            P = g.mT @ a  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
+                if bias_grad is not None:
+                    P = g.mT @ a  # [N, O, I]
+                    P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)  # [N, O, I+1]
+                    i += 1
+                    if p is not None:
+                        g_projection = self.projection(
+                            name, p, o, "left", g.device, g.dtype
+                        )
+                        a_projection = self.projection(
+                            name, p, i, "right", a.device, a.dtype
+                        ).T
+                        P = g_projection @ P @ a_projection
+                else:
+                    if p is not None:
+                        g_projection = self.projection(
+                            name, p, o, "left", g.device, g.dtype
+                        )
+                        g = g @ g_projection.T  # [N, S, p]
+                    P = g.mT @ a  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
+            else:
+                # No normalizer
+                if p is not None:
+                    g_projection = self.projection(
+                        name, p, o, "left", g.device, g.dtype
+                    )
+                    g = g @ g_projection.T  # [N, S, p]
+                P = g.mT @ a  # [N, O/p, I(+1)/p]
 
         P = P.flatten(1).clamp_(self.lo, self.hi)
 
