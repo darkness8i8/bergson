@@ -37,6 +37,10 @@ class Normalizer(ABC):
         if (cls := NORMALIZER_TYPES.get(class_name)) is None:
             raise ValueError(f"Unknown normalizer class: '{class_name}'")
 
+        # Migration: avg_sq was renamed to weight_avg_sq
+        if "avg_sq" in state_dict:
+            state_dict["weight_avg_sq"] = state_dict.pop("avg_sq")
+
         return cls(**state_dict)
 
     @abstractmethod
