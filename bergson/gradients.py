@@ -303,8 +303,8 @@ class AdafactorNormalizer(Normalizer):
     def scale_by_lr(self, lr: float | Tensor) -> None:
         """Scale normalizer by learning rate.
 
-        Factorized dimensions (row, col) are scaled by lr.
-        Bias is scaled by lr**2.
+        Factorized dimensions (row, col) are each scaled by sqrt(lr).
+        Bias is scaled by lr.
         """
         lr_sqrt = lr**0.5
         self.row.mul_(lr_sqrt)
