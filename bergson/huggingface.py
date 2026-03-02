@@ -303,20 +303,22 @@ class GradientCollectorCallback(TrainerCallback):
         for layer_name, moments in layer_second_moments.items():
             lr = moments["lr"]
 
+            lr_sq = lr**2
+
             # Adam-like: has weight exp_avg_sq
             if "weight" in moments:
-                weight_eas = moments["weight"] * lr
+                weight_eas = moments["weight"] / lr_sq
                 bias_eas = moments.get("bias")
-                bias_eas = bias_eas * lr if bias_eas is not None else None
+                bias_eas = bias_eas / lr_sq if bias_eas is not None else None
 
                 norm = AdamNormalizer(weight_eas, bias_eas)
 
             # Adafactor-like: has row/col factorization
             elif "row" in moments and "col" in moments:
-                row = moments["row"] * lr**0.5
-                col = moments["col"] * lr**0.5
+                row = moments["row"] / lr_sq
+                col = moments["col"] / lr_sq
                 bias_eas = moments.get("bias")
-                bias_eas = bias_eas * lr if bias_eas is not None else None
+                bias_eas = bias_eas / lr_sq if bias_eas is not None else None
 
                 norm = AdafactorNormalizer(row, col, bias_eas)
             else:

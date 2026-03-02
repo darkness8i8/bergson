@@ -404,13 +404,15 @@ class TestGradientCollectorCallback:
             weight_state = optimizer.state[layer.weight]
             lr = optimizer.param_groups[0]["lr"]
 
+            lr_sq = lr**2
+
             if optimizer_name == "adam":
                 # Check normalizer type
                 assert isinstance(norm, AdamNormalizer)
 
-                # Ground truth: Adam stores full exp_avg_sq
+                # Ground truth: Adam stores full exp_avg_sq, scaled by 1/lr²
                 raw_exp_avg_sq = weight_state["exp_avg_sq"]
-                expected_avg_sq = raw_exp_avg_sq * lr
+                expected_avg_sq = raw_exp_avg_sq / lr_sq
 
                 torch.testing.assert_close(norm.weight_avg_sq, expected_avg_sq)
 
@@ -418,14 +420,12 @@ class TestGradientCollectorCallback:
                 # Check normalizer type
                 assert isinstance(norm, AdafactorNormalizer)
 
-                # Ground truth: Adafactor stores row/col directly
-                lr_sqrt = lr**0.5
+                # Ground truth: Adafactor row/col, scaled by 1/lr²
                 raw_row = weight_state["exp_avg_sq_row"]
                 raw_col = weight_state["exp_avg_sq_col"]
 
-                # Our normalizer should match (scaled by LR)
-                expected_row = raw_row * lr_sqrt
-                expected_col = raw_col * lr_sqrt
+                expected_row = raw_row / lr_sq
+                expected_col = raw_col / lr_sq
 
                 torch.testing.assert_close(norm.row, expected_row)
                 torch.testing.assert_close(norm.col, expected_col)
@@ -434,7 +434,7 @@ class TestGradientCollectorCallback:
             if include_bias and layer.bias is not None:
                 bias_state = optimizer.state[layer.bias]
                 raw_bias_exp_avg_sq = bias_state["exp_avg_sq"]
-                expected_bias = raw_bias_exp_avg_sq * lr
+                expected_bias = raw_bias_exp_avg_sq / lr_sq
 
                 assert (
                     norm.bias_avg_sq is not None

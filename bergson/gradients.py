@@ -301,15 +301,15 @@ class AdafactorNormalizer(Normalizer):
         return AdamNormalizer(weight_avg_sq=weight_avg_sq, bias_avg_sq=self.bias_avg_sq)
 
     def scale_by_lr(self, lr: float | Tensor) -> None:
-        """Scale normalizer by learning rate.
+        """Rescale second moments so that ``normalize_`` reproduces the
+        effective Adafactor update: ``lr * g / sqrt(v_t)``.
 
-        Factorized dimensions (row, col) are each scaled by sqrt(lr).
-        Bias is scaled by lr.
+        Divides row, col, and bias_avg_sq by lr².
         """
-        lr_sqrt = lr**0.5
-        self.row.mul_(lr_sqrt)
-        self.col.mul_(lr_sqrt)
-        self.bias_avg_sq.mul_(lr) if self.bias_avg_sq is not None else None
+        lr_sq = lr**2
+        self.row.div_(lr_sq)
+        self.col.div_(lr_sq)
+        self.bias_avg_sq.div_(lr_sq) if self.bias_avg_sq is not None else None
 
 
 @dataclass
@@ -357,9 +357,10 @@ class AdamNormalizer(Normalizer):
         )
 
     def scale_by_lr(self, lr: float | Tensor) -> None:
-        """Scale normalizer to incorporate learning rate.
+        """Rescale second moments so that ``normalize_`` reproduces the
+        effective Adam update: ``lr * g / sqrt(v_t)``.
 
-        Both weight_avg_sq and bias_avg_sq are scaled by lr.
+        Divides weight_avg_sq and bias_avg_sq by lr².
         """
-        self.weight_avg_sq.mul_(lr)
-        self.bias_avg_sq.mul_(lr) if self.bias_avg_sq is not None else None
+        self.weight_avg_sq.div_(lr**2)
+        self.bias_avg_sq.div_(lr**2) if self.bias_avg_sq is not None else None
