@@ -126,13 +126,10 @@ class HookCollectorBase(ContextDecorator, ABC):
                 if not has_bias:
                     continue
                 normalizer = self.processor.normalizers.get(name)
-                if normalizer is not None and normalizer.bias_avg_sq is None:
-                    raise ValueError(
-                        f"Module '{name}' has bias and include_bias=True, but its "
-                        f"normalizer ({type(normalizer).__name__}) has no bias_avg_sq. "
-                        f"Fit normalizers with include_bias=True or provide "
-                        f"bias_avg_sq from optimizer state."
-                    )
+                assert normalizer is None or normalizer.bias_avg_sq is not None, (
+                    f"Module '{name}' has include_bias=True but normalizer "
+                    f"has no bias_avg_sq"
+                )
 
         # Allow subclasses to perform custom initialization
         self.setup()
