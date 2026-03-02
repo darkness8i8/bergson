@@ -87,6 +87,12 @@ class HookCollectorBase(ContextDecorator, ABC):
     """When True, compute per-position gradients instead of per-example, filtered
     to valid positions using ``_current_valid_mask``."""
 
+    lo: float = float("-inf")
+    """Lower clamp bound for gradients. Set by subclass ``setup()``."""
+
+    hi: float = float("inf")
+    """Upper clamp bound for gradients. Set by subclass ``setup()``."""
+
     logger = get_logger("HookCollectorBase", level="INFO")
 
     def __post_init__(
