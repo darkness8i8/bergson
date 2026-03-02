@@ -222,9 +222,7 @@ class InMemoryCollector(HookCollectorBase):
                 full_gradient = g.mT @ a
                 P = normalizer.normalize_(full_gradient)
                 if module._has_bias and normalizer.bias_avg_sq is not None:
-                    bias_grad = (
-                        g.sum(dim=1) / normalizer.bias_avg_sq.sqrt().add(1e-8)
-                    )
+                    bias_grad = g.sum(dim=1) / normalizer.bias_avg_sq.sqrt().add(1e-8)
                     P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)
                     i += 1
                 if p is not None:
@@ -242,8 +240,7 @@ class InMemoryCollector(HookCollectorBase):
                         )  # [N, S, O]
                     else:
                         bias_grad = (
-                            g.sum(dim=1)
-                            * normalizer.bias_avg_sq.add(1e-30).rsqrt()
+                            g.sum(dim=1) * normalizer.bias_avg_sq.add(1e-30).rsqrt()
                         )  # [N, O]
 
                 # Apply row normalization to g (for weights)
@@ -284,18 +281,14 @@ class InMemoryCollector(HookCollectorBase):
                     P = torch.cat([P, bias_grad.unsqueeze(2)], dim=2)
                     i += 1
                     if p is not None:
-                        g_proj = self.projection(
-                            name, p, o, "left", g.device, g.dtype
-                        )
+                        g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
                         a_proj = self.projection(
                             name, p, i, "right", a.device, a.dtype
                         ).T
                         P = g_proj @ P @ a_proj
                 else:
                     if p is not None:
-                        g_proj = self.projection(
-                            name, p, o, "left", g.device, g.dtype
-                        )
+                        g_proj = self.projection(name, p, o, "left", g.device, g.dtype)
                         g = g @ g_proj.T
 
                     P = g.mT @ a
