@@ -26,9 +26,7 @@ class GradientCollectorWithDistributedPreconditioners(HookCollectorBase):
 
     - For each forward/backward hook, we compute the the gradient or a low-rank
     approximation via random projections, if cfg.projection_dim is set.
-    - Supports also normalization via Adam or Adafactor normalizers.
-    - Uses Builder for index construction and gradient saving.
-    - Also supports Scorer for on-the-fly scoring of gradients.
+    - Supports normalization via Adam or Adafactor normalizers.
     """
 
     data: Dataset
