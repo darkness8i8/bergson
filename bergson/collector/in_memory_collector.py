@@ -168,7 +168,14 @@ class InMemoryCollector(HookCollectorBase):
             a = torch.cat([a, ones], dim=-1)
             i = i + 1
             setattr(module, LayerAdapter.in_attr(module), i)
-        if p is not None and (normalizer is None or not module._has_bias):
+        # Only defer a-projection when the normalizer will handle bias in backward
+        # (i.e., bias_avg_sq is populated). Otherwise project a now.
+        _defer_proj = (
+            module._has_bias
+            and normalizer is not None
+            and normalizer.bias_avg_sq is not None
+        )
+        if p is not None and not _defer_proj:
             a_proj = self.projection(name, p, i, "right", a.device, a.dtype).T
             a = a @ a_proj
         module._inputs = a

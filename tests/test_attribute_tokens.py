@@ -502,8 +502,9 @@ def _collect_in_memory(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("normalizer", ["none", "adam", "adafactor"])
 @pytest.mark.parametrize("include_bias", [False, True])
+@pytest.mark.parametrize("projection_dim", [None, 8])
 def test_token_sum_equals_sequence(
-    tmp_path, model, dataset, normalizer, include_bias
+    tmp_path, model, dataset, normalizer, include_bias, projection_dim
 ):
     """Sum of per-token grads must equal the per-example sequence grad.
 
@@ -546,7 +547,9 @@ def test_token_sum_equals_sequence(
         )
 
     processor = GradientProcessor(
-        normalizers=normalizers, include_bias=include_bias
+        normalizers=normalizers,
+        include_bias=include_bias,
+        projection_dim=projection_dim,
     )
 
     # --- Sequence grads (attribute_tokens=False) ---
