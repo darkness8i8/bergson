@@ -75,7 +75,7 @@ class NormalizerCollector(HookCollectorBase):
             assert isinstance(normalizer, AdamNormalizer)
 
         # in‐place accumulate
-        normalizer.avg_sq.add_(sq)
+        normalizer.weight_avg_sq.add_(sq)
 
     def setup(self) -> None:
         """
@@ -187,10 +187,10 @@ def fit_normalizers(
     # Divide by the number of documents processed and average across all ranks
     for normalizer in normalizers.values():
         if isinstance(normalizer, AdamNormalizer):
-            normalizer.avg_sq.div_(len(data))
+            normalizer.weight_avg_sq.div_(len(data))
 
             if dist.is_initialized():
-                dist.all_reduce(normalizer.avg_sq, op=dist.ReduceOp.AVG)
+                dist.all_reduce(normalizer.weight_avg_sq, op=dist.ReduceOp.AVG)
 
         elif isinstance(normalizer, AdafactorNormalizer):
             normalizer.row.div_(len(data))

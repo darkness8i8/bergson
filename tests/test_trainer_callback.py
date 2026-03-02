@@ -412,7 +412,7 @@ class TestGradientCollectorCallback:
                 raw_exp_avg_sq = weight_state["exp_avg_sq"]
                 expected_avg_sq = raw_exp_avg_sq * lr
 
-                torch.testing.assert_close(norm.avg_sq, expected_avg_sq)
+                torch.testing.assert_close(norm.weight_avg_sq, expected_avg_sq)
 
             elif optimizer_name == "adafactor":
                 # Check normalizer type

@@ -293,8 +293,8 @@ class AdafactorNormalizer(Normalizer):
         # NOTE: We don't add the epsilon here, since the AdamNormalizer is going to
         # add it outside the square root. This could cause infs though if there are
         # any exactly zero rows or columns, so we should be careful.
-        avg_sq = torch.outer(self.row, self.col) / self.row.mean()
-        return AdamNormalizer(avg_sq=avg_sq, bias_avg_sq=self.bias_avg_sq)
+        weight_avg_sq = torch.outer(self.row, self.col) / self.row.mean()
+        return AdamNormalizer(weight_avg_sq=weight_avg_sq, bias_avg_sq=self.bias_avg_sq)
 
     def scale_by_lr(self, lr: float | Tensor) -> None:
         """Scale normalizer by learning rate.
@@ -314,11 +314,11 @@ class AdamNormalizer(Normalizer):
     Contains the second moments of the gradients.
 
     Args:
-        avg_sq: Second moments for weights [O, I]
+        weight_avg_sq: Second moments for weights [O, I]
         bias_avg_sq: Optional second moments for bias [O]
     """
 
-    avg_sq: Tensor
+    weight_avg_sq: Tensor
     bias_avg_sq: Tensor | None = None
 
     @torch.compile
@@ -329,7 +329,7 @@ class AdamNormalizer(Normalizer):
     ) -> Tensor:
         """Normalize the gradients by the square root of the second moments."""
         # Adam-style epsilon is added outside the square root
-        denom = self.avg_sq.sqrt()
+        denom = self.weight_avg_sq.sqrt()
         return grad.div_(denom.add_(eps))
 
     def to_adafactor(self) -> AdafactorNormalizer:
@@ -340,22 +340,22 @@ class AdamNormalizer(Normalizer):
 
         Preserves bias_avg_sq if present.
         """
-        # We assume avg_sq is a square matrix of shape [O, I]
+        # We assume weight_avg_sq is a square matrix of shape [O, I]
         assert (
-            self.avg_sq.ndim == 2
-        ), f"Expected 2D tensor for avg_sq, got {self.avg_sq.ndim}D"
+            self.weight_avg_sq.ndim == 2
+        ), f"Expected 2D tensor for avg_sq, got {self.weight_avg_sq.ndim}D"
 
         # Compute row and column means
         return AdafactorNormalizer(
-            row=self.avg_sq.mean(dim=1),  # shape [O]
-            col=self.avg_sq.mean(dim=0),  # shape [I]
+            row=self.weight_avg_sq.mean(dim=1),  # shape [O]
+            col=self.weight_avg_sq.mean(dim=0),  # shape [I]
             bias_avg_sq=self.bias_avg_sq,
         )
 
     def scale_by_lr(self, lr: float | Tensor) -> None:
         """Scale normalizer to incorporate learning rate.
 
-        Both avg_sq and bias_avg_sq are divided by lr².
+        Both weight_avg_sq and bias_avg_sq are scaled by lr.
         """
-        self.avg_sq.mul_(lr)
+        self.weight_avg_sq.mul_(lr)
         self.bias_avg_sq.mul_(lr) if self.bias_avg_sq is not None else None
